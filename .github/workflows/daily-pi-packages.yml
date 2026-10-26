@@ -1,0 +1,96 @@
+name: Daily Pi Packages Monitor
+
+on:
+  schedule:
+    # Runs every day at 08:00 UTC
+    - cron: '0 8 * * *'
+  # Allows manual execution from the "Actions" tab for testing
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-new-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find and validate repositories
+        uses: actions/github-script@v8
+        with:
+          script: |
+            // 1. Calculate yesterday's date (YYYY-MM-DD format)
+            const yesterday = new Date();
+            yesterday.setDate(yesterday.getDate() - 1);
+            const dateStr = yesterday.toISOString().split('T')[0];
+
+            console.log(`Searching for repositories created since: ${dateStr}`);
+
+            // 2. Search for TypeScript repositories with "pi-package"
+            const query = `created:>${dateStr} language:typescript "pi-package" in:name,description,readme`;
+            
+            const searchResults = await github.rest.search.repos({
+              q: query,
+              sort: 'created',
+              order: 'desc',
+              per_page: 50
+            });
+
+            console.log(`Initial candidates found: ${searchResults.data.items.length}`);
+
+            const verifiedRepos = [];
+
+            // 3. Inspect each candidate's package.json
+            for (const repo of searchResults.data.items) {
+              try {
+                const response = await github.rest.repos.getContent({
+                  owner: repo.owner.login,
+                  repo: repo.name,
+                  path: 'package.json'
+                });
+
+                // The content is base64-encoded
+                const content = Buffer.from(response.data.content, 'base64').toString('utf8');
+                const pkg = JSON.parse(content);
+
+                // Verify that "keywords" is an array containing "pi-package"
+                if (Array.isArray(pkg.keywords) && pkg.keywords.includes('pi-package')) {
+                  console.log(`[VALID] ${repo.full_name}`);
+                  verifiedRepos.push({
+                    name: repo.full_name,
+                    url: repo.html_url,
+                    description: repo.description || 'No description',
+                    version: pkg.version || 'unknown',
+                    author: repo.owner.login
+                  });
+                } else {
+                  console.log(`[DISCARDED - Missing pi-package keyword] ${repo.full_name}`);
+                }
+              } catch (err) {
+                // Discard repositories without a root package.json or with a parsing error
+                console.log(`[DISCARDED - Missing package.json] ${repo.full_name}`);
+              }
+            }
+
+            // 4. Create an issue if verified repositories were found
+            if (verifiedRepos.length === 0) {
+              console.log('No new valid packages found today. No issue will be created.');
+              return;
+            }
+
+            const bodyLines = [
+              `### New packages detected for Pi Harness (${dateStr})`,
+              '',
+              'The following repositories were verified to contain `"pi-package"` in their `keywords`:',
+              '',
+              ...verifiedRepos.map(r => `- [**${r.name}**](${r.url}) (v${r.version}) - ${r.description}`)
+            ];
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Pi Packages] Updates for ${dateStr} (${verifiedRepos.length})`,
+              body: bodyLines.join('\n')
+            });
+
+            console.log(`Issue created with ${verifiedRepos.length} packages.`);
